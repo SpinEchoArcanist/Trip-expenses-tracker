@@ -1,0 +1,452 @@
+# Vacation Expense Tracker — Implementation Description
+# Current versions: ExpenseTracker.js 3.20 / ExpenseDashboard.js 2.0 / ExpenseQuickLog.js 2.0
+
+==============================================================
+  FILES OVERVIEW
+==============================================================
+
+File                      Role
+------------------------  ----------------------------------------
+ExpenseTracker.js         Main script: dashboard, log, edit, export
+ExpenseDashboard.js       Large home screen widget (read-only)
+ExpenseQuickLog.js        Small home screen widget (tap to log)
+expenses.json             All expense entries (auto-created)
+expense_settings.json     User settings (auto-created)
+
+All files live in:  iCloud Drive / Scriptable /
+
+==============================================================
+  DATA FORMAT
+==============================================================
+
+--- expenses.json ---
+
+Array of entry objects. Fields:
+
+  date        "YYYY-MM-DD"          required
+  time        "HH:MM"               required
+  category    string (see below)    required
+  amount      number                required  (native currency)
+  currency    "EUR" | "CHF"         required  (defaults to "EUR" if absent)
+  description string                required
+  lat         number (6 dp)         optional  (absent if location unavailable)
+  lon         number (6 dp)         optional
+
+--- expense_settings.json ---
+
+  chfToEur        number    Exchange rate: 1 CHF = N EUR  (default 1.09)
+  defaultCurrency "EUR"|"CHF"  Currency pre-selected when logging (default "EUR")
+  adaptiveAvgCur  "EUR"|"CHF"  Currency for AVG/DAY and OVERALL in Adaptive mode
+  displayMode     "ADAPTIVE"|"EUR"|"CHF"  Last-used display mode in dashboard
+
+All fields have defaults. File is created on first settings save.
+Missing file = all defaults used.
+
+==============================================================
+  CATEGORIES
+==============================================================
+
+Defined in CATEGORIES array in ExpenseTracker.js and mirrored in
+ExpenseDashboard.js. Must be kept in sync across both files.
+
+  Label                     Short      Color
+  ------------------------  ---------  -------
+  🍽️ Food                  Food       #E8622A  (orange-red)
+  🛒 Grocery               Grocery    #F4A261  (amber)
+  🛍️ Shopping              Shopping   #C2185B  (pink)
+  🚌 Transport             Transport  #2E7D32  (green)
+  🏛️ Visit / Activities    Visits     #1565C0  (blue)
+
+"Short" is the label with the emoji stripped, used in widget column headers.
+In the dashboard BY DAY table, only the emoji is shown in column headers
+(extracted with c.label.split(" ")[0] — no regex, Scriptable-safe).
+
+==============================================================
+  CURRENCY — ADAPTIVE DISPLAY LOGIC
+==============================================================
+
+All internal calculations use EUR as the common unit.
+Conversion: toEur(amount, currency, rate) = amount * rate if CHF, else amount.
+Display conversion: fromEur(eurAmount, currency, rate) = eurAmount / rate if CHF.
+
+Dominant currency for a set of entries:
+  Compare sum of CHF amounts * rate vs sum of EUR amounts.
+  CHF wins if (chfSum * rate) > eurSum.
+  Used to decide which currency to display for a given day.
+
+Three display modes, cycled by the header button:
+
+  ADAPTIVE (default):
+    TODAY block       -> today's dominant currency
+                         if CHF-dominant: show CHF value + small "= €X.XX" below
+    AVG/DAY block     -> adaptiveAvgCur (from settings)
+    OVERALL block     -> adaptiveAvgCur
+    Category TODAY    -> today's dominant currency
+    Category AVG/DAY  -> adaptiveAvgCur
+    Category TOTAL    -> adaptiveAvgCur
+    BY DAY rows       -> each day's dominant currency (per-row)
+    ALL ENTRIES       -> native currency (never converted)
+
+  EUR:
+    All values forced to EUR.
+
+  CHF:
+    All values forced to CHF.
+
+Mode is persisted to expense_settings.json on each cycle.
+Mode switch does NOT reload the HTML — handled entirely in WebView JS,
+updating DOM elements in place (no scroll jump).
+
+==============================================================
+  ExpenseTracker.js — MAIN SCRIPT
+==============================================================
+
+--- Entry point ---
+
+  const urlParam = args.queryParameters;
+  if (urlParam.action === "log") await logExpense();
+  await showDashboard();
+  // Script.complete() called inside showDashboard()
+
+Deep link "scriptable:///run/ExpenseTracker?action=log" runs logExpense()
+first, then opens the dashboard.
+Any other invocation (including action=dashboard) goes straight to dashboard.
+
+--- logExpense() — 2-step wizard ---
+
+Step 1: Single alert with amount text field + one button per category.
+        Currency taken silently from settings.defaultCurrency (shown in title).
+        Tapping a category button = validate amount + select category + advance.
+        Invalid amount shows error and stays on step 1.
+        Location fetch started in parallel at step 1 open (getCurrentLocation()).
+
+Step 2: Description text field. Actions: Save / Back / Cancel.
+        Back pre-fills amount and returns to step 1.
+
+On save:
+  Awaits location promise (usually already resolved by now).
+  Saves entry: { date, time, category, amount, currency, description, lat?, lon? }
+  Shows confirmation alert with all saved fields + location status.
+
+--- getCurrentLocation() ---
+
+  Location.setAccuracyToHundredMeters()
+  Promise.race([Location.current(), 10s timeout timer])
+  Returns { lat, lon } rounded to 6dp, or null on failure/timeout.
+  Never blocks the UI — always racing against a timeout.
+
+--- showDashboard() + runPollLoop() ---
+
+Architecture:
+  wv = new WebView()
+  await wv.loadHTML(buildDashboardHTML(settings))
+  await Promise.race([wv.present(true), runPollLoop(wv, settings)])
+  Script.complete()
+
+wv.present(true) = full-screen presentation (covers entire screen on iPad too).
+Its promise resolves when the user closes via Scriptable's native Close button.
+runPollLoop() resolves when it returns (currently only on evaluateJavaScript throw).
+
+This means:
+  - Scriptable Close button -> wv.present(true) resolves -> race resolves -> Script.complete()
+  - Any JS context error    -> evaluateJavaScript throws -> runPollLoop returns -> race resolves
+
+Poll loop (300ms interval):
+  1. evaluateJavaScript("typeof _action !== 'undefined' ? _action : null")
+     On throw: return (WebView gone).
+  2. If null: continue.
+  3. evaluateJavaScript("_action = null")  — clear flag
+     On throw: return.
+  4. Dispatch on action string:
+       "setMode:X"    -> persist mode, continue (NO reload)
+       "log"          -> await logExpense()
+       "export"       -> await exportCSV()
+       "settings"     -> await showSettings(); reload settings
+       "editIdx:N"    -> await editEntry(entries, N)
+       "mapIdx:N"     -> show Apple Maps / Google Maps picker, open Safari
+  5. Capture scrollY before reload.
+  6. await wv.loadHTML(buildDashboardHTML(settings))
+  7. After 80ms: evaluateJavaScript("window.scrollTo(0, scrollY)")
+
+Native alerts (log, edit, settings, map) are modal above the WebView.
+The user cannot close the WebView while an alert is showing, so there is
+no race condition between the present-promise and the alert being open.
+
+--- buildDashboardHTML(settings) ---
+
+Returns a complete HTML string. All data is embedded as a JSON literal
+(var D = {...}) so the WebView's JS is self-contained and makes no
+Scriptable API calls.
+
+Embedded data structure (D):
+  rate            number       chfToEur exchange rate
+  adaptiveAvgCur  "EUR"|"CHF"  for AVG/DAY and OVERALL in adaptive mode
+  initialMode     string       display mode to start with
+  today           "YYYY-MM-DD"
+  nPastDays       number       distinct past days (excludes today) for avg
+  days[]          array        one per day, sorted newest-first:
+    date          "YYYY-MM-DD"
+    isToday       bool
+    entries[]     [{amount, currency}]  for dominant-currency detection
+    catEur{}      {label: eurTotal}     per-category EUR totals for BY DAY table
+  categories[]    array        one per category:
+    label, short, color
+    dailyEur, pastEur, overallEur
+  totalAllEur     number
+  totalTodayEur   number
+  pastTotalEur    number
+
+HTML layout (top to bottom):
+
+  STICKY HEADER
+    Left:  "✈️ Vacation Expenses" + today's date (DD/MM/YYYY)
+    Right: Currency mode button (cycles ADAPTIVE -> EUR -> CHF -> ...)
+
+  TOTALS BAR
+    Three blocks: TODAY | AVG/DAY (cur) | OVERALL (cur)
+    Values filled by render() based on current mode.
+    In ADAPTIVE mode if today is CHF-dominant, TODAY shows a small
+    "= €X.XX" sub-line.
+
+  RATE NOTE
+    "1 CHF = X EUR · mode: ..." — updated by render() on mode change.
+
+  SECTION: BY CATEGORY  (foldable, default expanded)
+    Tapping the section title toggles collapse. Chevron flips ▼/▶.
+    Table columns: Category | Today | Avg/day | Total | mini bar chart
+    All values rendered by render() in the active display currency.
+
+  SECTION: BY DAY  (foldable, default expanded)
+    Horizontally scrollable (overflow-x: auto).
+    Date column is position:sticky with box-shadow separator.
+    Table columns: Date | [one per category emoji] | Tot.
+    Header row and data rows both written into a single <tbody id="dayBody">.
+    Date format: "Thu 02 Apr" (weekday + day + month name, no year).
+    Today row shown in green (bold date, no badge).
+    Past rows in yellow.
+    Each cell uses the day's dominant currency in ADAPTIVE mode.
+    Category column headers show emoji only (c.label.split(" ")[0]).
+    CRITICAL: only one <tbody> in the table. Two tbodys causes the second
+    to be silently dropped by WKWebView, making the table appear empty.
+
+  SECTION: ALL ENTRIES  (foldable, default expanded)
+    Day header rows are also foldable (toggleDay per day key YYYYMMDD).
+    Clicking a day header collapses/expands its entry rows.
+    Day header shows: weekday + date + chevron + day total (right-aligned).
+    Day total updated by render() via childNodes[0].textContent to preserve
+    the chevron span child.
+    Entry rows show: time | dot+description | native amount | 📍 | ✏️
+    Native currency means the original entry currency, never converted.
+    📍 button: enabled (tappable) only when lat/lon stored, greyed otherwise.
+    ✏️ and 📍 buttons use event.stopPropagation() to avoid triggering
+    the parent day-header fold toggle.
+
+  FIXED BOTTOM ACTION BAR
+    ➕ New | ⚙️ Settings | 📤 Export
+    Font size 1.067rem, padding 15px. Action spacer height 96px.
+
+CSS notes:
+  All font sizes in rem (no px), relative to html root.
+  Root font: clamp(1rem, 2.2vw, 1.4rem)
+    -> iPhone: uses system rem (tracks iOS Dynamic Type setting)
+    -> iPad:   scales up to 1.4x the Dynamic Type base
+  All sections use section-body div with .collapsed class (display:none).
+  .day-scroll uses overflow-x:auto; table uses width:max-content.
+  No negative margins on scroll containers (causes WKWebView render failures).
+  No regex with backslash escapes in WebView JS strings — Scriptable's
+  template literal parser strips backslashes, turning \S into S.
+  Use .split(" ") instead of /\S+/ for emoji extraction.
+
+WebView JS functions:
+  render()          Redraws all dynamic values for current mode.
+                    Called once on load, then after every HTML reload.
+  cycleMode()       Advances mode, calls render(), sends "setMode:X" action.
+                    Mode change does NOT trigger a Scriptable-side reload.
+  toggleSection(id) Collapses/expands BY CATEGORY / BY DAY / ALL ENTRIES.
+                    State in sectionCollapsed{} object. Survives mode changes.
+  toggleDay(key)    Collapses/expands entry rows for a given day.
+                    State in dayCollapsed{} object. Survives mode changes.
+  done(action)      Sets _action = action. Picked up by poll loop within 300ms.
+
+--- showSettings() ---
+
+Menu loop with three options, each with Back navigation:
+  1. Exchange rate     edit chfToEur (decimal)
+  2. Default currency  EUR or CHF for new entries
+  3. Adaptive avg cur  EUR or CHF for AVG/DAY and OVERALL in adaptive mode
+
+--- editEntry(entries, idx) ---
+
+Field picker loop. Shows entry summary (including location as read-only).
+Editable fields: Date / Time / Amount & Currency / Category / Description / Delete.
+Cancel on any sub-alert -> back to field picker (not exit).
+Done on field picker -> back to dashboard.
+Amount & Currency is a 2-sub-step flow with Back between them.
+After each save: confirm with "Done" (exit) or "Edit more" (stay in loop).
+Location is displayed as read-only info, not editable.
+
+--- exportCSV() ---
+
+Columns: Date, Time, Category, Currency, Amount, Amount (EUR),
+         Latitude, Longitude, Description
+EUR conversion uses current settings.chfToEur.
+Lat/Lon empty string when absent.
+Filename: VacationExpenses_YYYYMMDD_HHMMSS.csv
+  -> Always unique (timestamped to the second), never overwrites.
+Saved to: iCloud Drive / Scriptable / VacationExpenses_YYYYMMDD_HHMMSS.csv
+Confirmation alert shows exact filename.
+
+==============================================================
+  ExpenseDashboard.js — LARGE WIDGET (VERSION 2.0)
+==============================================================
+
+Large home screen widget. Read-only. Tap opens dashboard.
+Tap URL: scriptable:///run/ExpenseTracker?action=dashboard
+
+Reads both expenses.json and expense_settings.json.
+Mirrors ADAPTIVE display mode rules from ExpenseTracker (no mode toggle,
+always adaptive).
+
+Layout (top to bottom):
+  Header: "✈️ Vacation Expenses" (left) + date short format (right)
+  Totals row: TODAY | AVG/DAY (cur) | OVERALL (cur)
+    TODAY: today's dominant currency + optional "= €X.XX" sub-note if CHF
+    AVG/DAY: adaptiveAvgCur
+    OVERALL: adaptiveAvgCur
+  Rate note: "1 CHF = X EUR · Adaptive"
+  Category table:
+    Columns: dot+short name | mini bar | TODAY | AVG/DAY | TOTAL
+    TODAY: today's dominant currency
+    AVG/DAY + TOTAL: adaptiveAvgCur
+  TODAY'S ENTRIES list:
+    dot + time + description + native amount (never converted)
+  Footer: "Tap to open dashboard"
+
+Currency helpers (all identical to ExpenseTracker):
+  toEur(amount, currency, rate)
+  fromEur(eurAmount, currency, rate)
+  fmtCur(amount, currency)       -> "CHF X.XX" or "€X.XX"
+  dominantCurrency(entries, rate)
+
+AVG/DAY excludes today (uses pastEntries / nPastDays).
+All category stats computed in EUR, converted at render time.
+
+==============================================================
+  ExpenseQuickLog.js — SMALL WIDGET (VERSION 2.0)
+==============================================================
+
+Small home screen widget. Shows today's total + entry count.
+Tap URL: scriptable:///run/ExpenseTracker?action=log
+  -> runs logExpense() first, then opens dashboard.
+
+Reads both expenses.json and expense_settings.json.
+
+Adaptive display (always, no mode toggle):
+  Computes today's dominant currency.
+  Shows total in dominant currency (green, large).
+  If CHF-dominant and total > 0: shows small "= €X.XX" sub-note.
+
+Layout:
+  "✈️ Today" label (muted)
+  Daily total in dominant currency (large green)
+  Optional EUR sub-note if CHF-dominant
+  Entry count ("no entries" / "1 entry" / "N entries")
+  Spacer
+  Large + button (yellow circle)
+  "Tap to add" hint
+
+==============================================================
+  TECHNICAL CONSTRAINTS — MUST RESPECT
+==============================================================
+
+--- Scriptable JS parser: ASCII-only in comments and template literals ---
+
+Scriptable rejects Unicode characters in range U+0080-U+1FFF anywhere
+in the script source, including inside comments and string literals.
+This includes box-drawing characters, em dashes, and smart quotes.
+Emoji (above U+1FFF) are safe in string literals only.
+Use only ASCII in comments.
+
+IMPORTANT: backslash-escape sequences inside template literal strings
+passed to loadHTML() are processed by Scriptable's parser BEFORE the
+WebView sees them. This means regex patterns like /\S+/ embedded in
+the HTML template become /S+/ in the WebView (backslash stripped).
+NEVER use regex backslash escapes in WebView JS code inside template
+literals. Use string methods instead:
+  c.label.split(" ")[0]   instead of   c.label.match(/^\S+/)[0]
+  c.label.split(" ").slice(1).join(" ")  instead of  c.label.replace(/^\S+\s*/, "")
+
+--- WebView communication ---
+
+Use poll loop (evaluateJavaScript every 300ms) to read _action variable.
+Never use window.location redirects (Scriptable throws "URL not supported").
+evaluateJavaScript throws when WebView JS context is destroyed.
+Catch the throw and return from the poll loop.
+
+--- WebView presentation ---
+
+wv.present(true) = full-screen (fills entire iPad screen).
+wv.present(false) = page sheet (narrow card on iPad, avoid).
+The present() promise resolves when the user closes the WebView via
+Scriptable's native Close button or any native dismissal gesture.
+Use Promise.race([wv.present(true), runPollLoop(wv, settings)]) so
+that EITHER a native close OR an in-app action can terminate the script.
+Script.complete() is called exactly once after the race resolves.
+Never await wv.present() alone — it blocks until dismissed and prevents
+native alerts from being shown.
+
+--- HTML table structure ---
+
+Only ONE <tbody> per <table>. WKWebView silently drops additional
+<tbody> elements, making the table appear empty with no JS error.
+Write header rows and data rows into the same <tbody> via innerHTML.
+
+--- Scroll restoration ---
+
+Before every loadHTML():
+  scrollY = await wv.evaluateJavaScript("window.scrollY || 0")
+After loadHTML(), wait 80ms, then:
+  await wv.evaluateJavaScript("window.scrollTo(0, " + scrollY + ")")
+
+--- setMode: action (no reload) ---
+
+When poll loop reads "setMode:X", persist to settings and continue.
+Do NOT call loadHTML(). The WebView JS has already updated the DOM.
+This avoids a scroll-jump on currency mode switch.
+
+--- Negative margin on overflow-x containers ---
+
+Never use margin: 0 -16px on an overflow-x:auto div.
+WKWebView can compute the scrollable width as zero (or negative),
+making the table invisible with no JS error.
+Instead set width:max-content; min-width:100% on the table inside.
+
+--- iCloud FileManager ---
+
+Always call fm.downloadFileFromiCloud(path) before reading any file.
+The file may exist locally but be a placeholder not yet downloaded.
+
+--- Location ---
+
+Always use Location.setAccuracyToHundredMeters() before Location.current().
+Always race with a 10-second Timer to avoid blocking.
+Start the fetch as early as possible (step 1 of log wizard), await at save.
+Round lat/lon to 6 decimal places.
+Store as entry.lat and entry.lon. Absent = location unavailable.
+
+--- Deep links ---
+
+Format: scriptable:///run/ScriptName?action=value
+Examples:
+  scriptable:///run/ExpenseTracker?action=log
+  scriptable:///run/ExpenseTracker?action=dashboard
+
+==============================================================
+  HOME SCREEN SETUP
+==============================================================
+
+Widget        Size    Script              Tap action
+------------  ------  ------------------  ----------------------------
+Dashboard     Large   ExpenseDashboard    Opens dashboard (full-screen)
+Quick Log     Small   ExpenseQuickLog     Opens log form directly
+App icon      -       ExpenseTracker      Opens dashboard directly
