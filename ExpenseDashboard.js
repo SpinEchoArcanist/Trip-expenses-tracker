@@ -1,7 +1,7 @@
 // Variables used by Scriptable.
 // These must be at the very top of the file. Do not edit.
 // icon-color: blue; icon-glyph: magic;
-// VERSION 3.3 - 2026-05-07
+// VERSION 3.4 - 2026-08-08
 // ===================================================================
 //  VACATION EXPENSE DASHBOARD  -  ExpenseDashboard.js
 //  Large Home Screen widget - tap opens in-app dashboard
@@ -10,6 +10,11 @@
 //  Multi-currency: EUR, CHF, + configurable third currency
 //  Third currency defined in expense_settings.json:
 //    cur3Code, cur3Symbol, cur3Flag, cur3Name, chfToCur3
+//  + Trip name (NEW in 3.4): shows settings.tripName in the header in
+//    place of "Vacation Expenses" when set (set via ExpenseTracker.js
+//    → Settings → Trip name & description). The description itself is
+//    intentionally not shown here — it's an on-demand popup in the
+//    main dashboard only, this widget has no interaction beyond tap.
 // ===================================================================
 
 const DATA_FILE     = "expenses.json";
@@ -50,6 +55,7 @@ function loadSettings() {
     cur3Symbol: "\u00A5",
     cur3Flag:   "\uD83C\uDDEF\uD83C\uDDF5",
     cur3Name:   "Japanese Yen",
+    tripName:   "",
   };
   if (!fm.fileExists(settingsPath)) return defaults;
   try {
@@ -183,9 +189,12 @@ widget.url = "scriptable:///run/ExpenseTracker?action=dashboard";
 const header = widget.addStack();
 header.layoutHorizontally();
 header.centerAlignContent();
-const titleTxt = header.addText("\u2708\uFE0F  Vacation Expenses");
+const tripName = (settings.tripName || "").trim();
+const titleTxt = header.addText(tripName ? tripName : "\u2708\uFE0F  Vacation Expenses");
 titleTxt.font      = Font.boldSystemFont(13);
 titleTxt.textColor = C_MUTED;
+titleTxt.lineLimit = 1;
+titleTxt.minimumScaleFactor = 0.7;
 header.addSpacer();
 const dateTxt = header.addText(fmtDateShort(today));
 dateTxt.font      = Font.systemFont(11);

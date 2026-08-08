@@ -8,14 +8,16 @@ A fully self-contained, multi-currency expense tracking system for iOS, built wi
 
 - **Log expenses in seconds** — two-step native alert: amount + category, then description
 - **Multi-currency** — EUR, CHF, and a fully configurable third currency (default: GBP). Adaptive display shows each day's dominant currency with a CHF equivalent sub-note
+- **Trip name & description** — give the trip a short name shown at the top of the dashboard and the large widget, plus a longer free-text description viewable on demand
+- **Trip Dates for accurate averages** — define explicit trip start/end dates so zero-expense days count toward AVG/DAY, not just days with entries; falls back to automatic gap-fill detection when no dates are set
 - **GPS tagging** — location is captured automatically when logging and can be opened in Apple Maps or Google Maps
 - **Full dashboard** — scrollable WebView with three collapsible sections: By Category, By Day, All Entries
 - **Two home screen widgets** — a large summary widget and a small quick-log widget
 - **Edit and delete** — any field of any entry can be edited at any time
-- **Bulk edit** — select multiple entries and apply a category, currency, ghost status, date change, or deletion in one action
+- **Bulk edit** — select multiple entries and apply a category, currency, ghost status, date change, or deletion in one action, and keep applying more edits without leaving the screen
 - **Ghost entries** — exclude any entry from all statistics and averages while keeping it visible in the list (reversible)
 - **CSV export** — timestamped export to iCloud Drive, one file per export, never overwrites
-- **JSON export / import** — export a full backup including currency metadata; import merges or replaces with duplicate detection and automatic currency mismatch handling
+- **JSON export / import** — export a full backup including currency metadata, trip dates, and trip name/description; import merges or replaces with duplicate detection and automatic mismatch handling
 - **iPad and iPhone** — full-screen on iPad, adaptive font size that respects iOS Dynamic Type
 
 ---
@@ -79,6 +81,8 @@ All files must live in: **iCloud Drive / Scriptable /**
   - **👻 Ghost** — exclude from or restore to statistics
   - **📅 Move date** — reassign all selected entries to a new date
   - **🗑️ Delete selected** — permanently remove all selected entries (with confirmation)
+- After applying a change, the screen **refreshes itself in place** with the freshly saved data — checkboxes clear and the list reflects your edit immediately. You can select more entries and apply another change right away, as many times as you like, all in the same session.
+- A reminder banner at the top of the screen shows how to leave: tap **Close** in Scriptable's native toolbar (top of screen). Scriptable cannot close this screen automatically, so that tap is always required once you're done. If you tap **Cancel**, or delete every remaining entry, the checklist is replaced with a short confirmation screen so nothing stale is left on screen while you look for the Close button.
 
 ### Ghost entries
 
@@ -92,6 +96,26 @@ All files must live in: **iCloud Drive / Scriptable /**
 - Entries logged with GPS show an active **📍** button.
 - Tap it to open the location in Apple Maps or Google Maps.
 
+### Trip name & description
+
+- Tap **⚙️** → **🏷️ Trip name & description**, or tap the trip name/title at the top of the dashboard once one is set.
+- **Name** — a short label (up to 60 characters, e.g. "Rome getaway") shown in place of "✈️ Vacation Expenses" at the top of the dashboard and the large widget.
+- **Description** — a longer free-text note (single line, no manual line breaks — a Scriptable text field limitation) that is **never shown inline**. It only appears in a popup, opened by tapping the trip name/title on the dashboard or via Settings. This keeps the header compact while still letting you keep extra trip details (dates, addresses, notes) somewhere easy to find.
+- Once a name is set, the dashboard title becomes tappable (shown with a small ⓘ) and opens that popup directly; the popup itself has an **✏️ Edit** button that jumps back into the same name/description editor.
+- Both fields are optional — leaving them blank restores the default "✈️ Vacation Expenses" title everywhere.
+
+### Trip Dates (for accurate AVG/DAY)
+
+By default, AVG/DAY only counted days that had at least one logged expense — a day with zero spending (because you stayed in, or didn't travel) simply didn't count, which understated real savings. Trip Dates fixes this by counting **every day of the trip**, spend or no spend, toward the average.
+
+- Tap **⚙️** → **🗓️ Trip dates** → **Set start date** / **Set end date** (format `YYYY-MM-DD`).
+- Once both dates are set, every calendar day from start to end counts toward AVG/DAY, including days with zero entries. A "no expenses" row appears in the **BY DAY** table for each of those zero-spend days so you can see exactly which days are lowering the average, rather than it happening invisibly.
+- **Entries outside the trip date range** (e.g. an airport purchase the day before departure) stay fully visible in **ALL ENTRIES** and **BY DAY** — marked with an "outside trip" badge — but are excluded from AVG/DAY, OVERALL, and the BY CATEGORY totals, so pre/post-trip spending doesn't skew your trip's real average.
+- **Today and future days are never counted**, even if they fall inside the trip date range — the average only reflects days that have actually happened.
+- **If no Trip Dates are set**, the tracker falls back to automatic detection: zero-expense days *between* your earliest and latest logged entry are gap-filled and counted (e.g. entries on day 1 and day 4 with nothing on days 2–3 will count days 2–3 as zero-spend days). This fallback cannot infer the very first or last day of the trip if it has no entries — only Trip Dates can cover that edge correctly, which is why it's the recommended approach for the most accurate average.
+- A small subtitle beneath the exchange-rate note on the dashboard shows which mode is active — either your Trip Dates range and day count, or "Auto range (gaps counted)" with a nudge to set explicit dates.
+- Use **🗑️ Clear trip dates** to remove the range and revert to automatic detection.
+
 ### Changing settings
 
 - Tap **⚙️** in the dashboard action bar.
@@ -99,6 +123,8 @@ All files must live in: **iCloud Drive / Scriptable /**
 - **🌍 Third currency** — choose from a preset list (GBP, JPY, USD, SEK, CZK, HUF, PLN, NOK, DKK, THB, HKD) or enter a fully custom currency with its own code, symbol, flag emoji, name, and rate. The selected currency becomes the third display mode alongside EUR and CHF.
 - **💹 Third currency rate** — update just the exchange rate for the current third currency without changing which currency it is.
 - **💶 Default currency for new entries** — CHF, EUR, or the current third currency. Used automatically when logging a new expense.
+- **🗓️ Trip dates** — set, view, or clear the explicit trip date range (see above).
+- **🏷️ Trip name & description** — set, view, or clear the trip's display name and description (see above).
 
 ### Exporting and importing data
 
@@ -106,13 +132,13 @@ All files must live in: **iCloud Drive / Scriptable /**
 
 **📊 Export CSV** — saves a timestamped `.csv` file to iCloud Drive / Scriptable. Each export creates a new file. Columns: Date, Time, Category, Currency, Amount, Amount (CHF), Latitude, Longitude, Description, Ghost.
 
-**📦 Export JSON** — saves a timestamped `.json` file containing all entries plus a `meta` block with the current third-currency configuration (code, symbol, flag, name, and rates). This allows the currency context to travel with the backup file.
+**📦 Export JSON** — saves a timestamped `.json` file containing all entries plus a `meta` block with the current third-currency configuration, trip dates, and trip name/description. This allows the full trip context to travel with the backup file.
 
-**📥 Import JSON** — opens a file picker. Supports both the new `{ meta, entries }` format and the legacy bare-array format. If the imported file's third currency differs from your current settings, you are warned before any data is loaded. Proceeding automatically updates your third-currency settings (code, symbol, flag, name, and rate) to match the file. If you cancel, nothing is imported and nothing changes. After the currency check, you can choose to **Merge** (keep existing entries and add new ones) or **Replace** (clear existing entries first). Duplicate entries (same date + time + description) are skipped automatically.
+**📥 Import JSON** — opens a file picker. Supports both the new `{ meta, entries }` format and the legacy bare-array format. If the imported file's third currency, trip dates, or trip name/description differ from your current settings, you are warned before any data is loaded (a blank local setting is filled in silently instead, since there's nothing to overwrite). Proceeding updates the corresponding settings to match the file. If you cancel any of these checks, nothing is imported and nothing changes. After the checks, you can choose to **Merge** (keep existing entries and add new ones) or **Replace** (clear existing entries first). Duplicate entries (same date + time + description) are skipped automatically.
 
 ### Closing the dashboard
 
-- Tap the **Close** button in Scriptable's native toolbar (top of screen). The script exits cleanly.
+- Tap the **Close** button in Scriptable's native toolbar (top of screen). The script exits cleanly. This also applies to the Bulk Edit screen — see [Bulk editing entries](#bulk-editing-entries) above.
 
 ---
 
@@ -149,7 +175,7 @@ Each value is shown in the most natural currency for its context. A CHF equivale
 
 \* *Today's dominant currency*: whichever currency has the highest CHF-equivalent total for today's active entries. If today has no entries, the most recent past day's dominant currency is used. Falls back to CHF if no history exists.
 
-† *Overall dominant currency*: whichever currency has the highest CHF-equivalent total across all active entries in the trip.
+† *Overall dominant currency*: whichever currency has the highest CHF-equivalent total across all **in-trip-window** active entries (see [Trip Dates](#trip-dates-for-accurate-avgday) — entries outside an explicit trip date range are excluded from this and all other aggregate figures).
 
 CHF is the internal reference currency for all calculations. All amounts are converted to CHF first, then to the display currency, minimising rounding errors.
 
@@ -161,14 +187,18 @@ All values are forced into the selected currency. Sub-notes showing the CHF equi
 
 ## Dashboard sections
 
+### Header
+
+Shows the trip name (if set, tappable to view the description — see [Trip name & description](#trip-name--description)) or "✈️ Vacation Expenses" by default, plus today's date. Below the exchange-rate note, a subtitle shows the active trip-day-counting mode (explicit Trip Dates range, or auto gap-fill) and how many days are currently counted toward AVG/DAY.
+
 ### BY CATEGORY
-A table showing today's spend, average per day (past days only), and overall total for each category. All values update instantly when you cycle the display mode — no page reload. Ghost entries are excluded from all figures.
+A table showing today's spend, average per day (counted past days only — see [Trip Dates](#trip-dates-for-accurate-avgday)), and overall total for each category. All values update instantly when you cycle the display mode — no page reload. Ghost entries, and entries outside an explicit trip date range, are excluded from all figures.
 
 ### BY DAY
-A horizontally scrollable table with one row per day and one column per category, plus a daily total. The Date column is sticky (stays visible while scrolling). Today's row is shown in green, past days in yellow. Dates are formatted as `Thu 02 Apr`. Ghost entries are excluded from all figures.
+A horizontally scrollable table with one row per day and one column per category, plus a daily total. The Date column is sticky (stays visible while scrolling). Today's row is shown in green, past days in yellow. Dates are formatted as `Thu 02 Apr`. Ghost entries are excluded from all figures. Days counted only because of Trip Dates / gap-fill (i.e. no actual entries) appear as dimmed "no expenses" rows. Days that fall outside an explicit trip date range are marked with an "outside trip" badge and dimmed, but their native totals are still shown for reference.
 
 ### ALL ENTRIES
-A full chronological list of every entry, grouped by day. Each day header is tappable to collapse or expand that day's entries. The day header shows the weekday, date, and daily total (active entries only). Each entry row shows the time, category dot, description, and native amount. Ghost entries appear dimmed with a strikethrough amount and a 👻 icon.
+A full chronological list of every entry, grouped by day. Each day header is tappable to collapse or expand that day's entries. The day header shows the weekday, date, and daily total (active entries only), and is marked "outside trip" when Trip Dates are set and the day falls outside the range. Each entry row shows the time, category dot, description, and native amount. Ghost entries appear dimmed with a strikethrough amount and a 👻 icon.
 
 All three sections are collapsible — tap the section title to toggle.
 
@@ -179,12 +209,13 @@ All three sections are collapsible — tap the section title to toggle.
 ### Large widget — ExpenseDashboard
 
 Shows at a glance:
+- Trip name (if set) in place of "✈️ Vacation Expenses", plus today's date
 - TODAY / AVG/DAY / OVERALL totals (always in Adaptive mode)
 - Exchange rate note for both EUR and the current third currency
 - Category breakdown with mini bar charts (TODAY, AVG/DAY, TOTAL columns)
 - Today's entries list with native amounts
 
-Tap anywhere to open the full dashboard.
+Tap anywhere to open the full dashboard. The trip description is intentionally **not** shown here — it's only ever available on demand from the main dashboard, since the widget has no interactive popup beyond the tap-to-open action.
 
 ### Small widget — ExpenseQuickLog
 
@@ -227,23 +258,33 @@ Tap anywhere to open the log form directly.
   "cur3Flag": "🇬🇧",
   "cur3Name": "British Pound",
   "displayMode": "ADAPTIVE",
-  "defaultCurrency": "CHF"
+  "defaultCurrency": "CHF",
+  "tripStart": "2026-06-01",
+  "tripEnd": "2026-06-15",
+  "tripName": "Rome getaway",
+  "tripDescription": "Anniversary trip, staying near Trastevere"
 }
 ```
 
-JSON export files use a wrapper format so that currency context travels with the backup:
+`tripStart`, `tripEnd`, `tripName`, and `tripDescription` are all optional and default to an empty string. An empty `tripStart`/`tripEnd` pair means the AVG/DAY calculation falls back to automatic gap-fill detection (see [Trip Dates](#trip-dates-for-accurate-avgday)). An empty `tripName`/`tripDescription` means the default "✈️ Vacation Expenses" title is shown everywhere.
+
+JSON export files use a wrapper format so that the full trip context travels with the backup:
 
 ```json
 {
   "meta": {
-    "exportDate": "2026-05-07",
-    "appVersion": "5.7",
+    "exportDate": "2026-08-08",
+    "appVersion": "5.10",
     "cur3Code": "GBP",
     "cur3Symbol": "£",
     "cur3Flag": "🇬🇧",
     "cur3Name": "British Pound",
     "chfToCur3": 1.13,
-    "chfToEur": 1.09
+    "chfToEur": 1.09,
+    "tripStart": "2026-06-01",
+    "tripEnd": "2026-06-15",
+    "tripName": "Rome getaway",
+    "tripDescription": "Anniversary trip, staying near Trastevere"
   },
   "entries": [ ... ]
 }
@@ -255,10 +296,13 @@ JSON export files use a wrapper format so that currency context travels with the
 
 - Built for [Scriptable](https://scriptable.app) on iOS 16+.
 - The dashboard is a full-screen WebView (`wv.present(true)`) with a 300ms JavaScript poll loop communicating via a shared `_action` variable.
-- Closing is handled via `Promise.race([wv.present(true), runPollLoop()])` — Scriptable's native Close button resolves the present-promise and triggers `Script.complete()` cleanly.
+- Closing is handled via `Promise.race([wv.present(true), runPollLoop()])` — Scriptable's native Close button resolves the present-promise and triggers `Script.complete()` cleanly. **Scriptable cannot programmatically dismiss a presented WebView** — this is a hard platform limitation, not a bug. The Bulk Edit screen uses the same `Promise.race` + persistent poll loop pattern (`runBulkPollLoop`): instead of ending the loop after one applied change, it reloads its own HTML in place with fresh data and keeps listening, so multiple bulk edits can be applied in one sitting without the user needing to close and reopen the screen. A goodbye screen (`buildBulkCloseHTML`) replaces the checklist once there's nothing left to do (Cancel, or all entries deleted), and a permanent header banner reminds the user that a native Close tap is still required to leave.
 - All font sizes use `rem` units with `html { font-size: clamp(1rem, 2.2vw, 1.4rem) }` — scales smoothly from iPhone to iPad and respects iOS Dynamic Type.
 - Backslash escapes in regex patterns (`\S`, `\d`) are stripped by Scriptable's JS parser when embedded in template literals passed to `wv.loadHTML()`. Use string methods instead: `str.split(" ")[0]` not `/^\S+/.exec(str)[0]`.
+- Unicode characters in the U+0080–U+1FFF range inside **comments** cause `SyntaxError: Invalid character` in Scriptable's parser — keep comments ASCII-only. Emoji inside string literals (e.g. category labels, alert titles) are unaffected and safe.
 - Only one `<tbody>` per `<table>` — WKWebView silently drops additional tbody elements.
 - Negative margins on `overflow-x:auto` containers cause WKWebView to compute zero scroll width. Use `width:max-content; min-width:100%` on the inner table instead.
 - `loadData()` guards against iCloud sync races: if the file exists but returns a non-array value (e.g. partially written during sync), it falls back to an empty array rather than crashing.
 - `loadSettings()` automatically migrates settings files from the pre-v5.6 format (which used `chfToJpy` as a fixed field) to the new `chfToCur3 / cur3*` fields on first run, without any manual intervention.
+- Free-text user input embedded into WebView HTML (trip name and description) is passed through an `escapeHtml()` helper before being written into the page — without this, characters like `<`, `>`, `&`, or quotes in a trip name could break the markup or inject unintended HTML.
+- Trip Dates day-counting (`computeCountedPastDates`) never counts today or future days, even when they fall inside an explicit trip range — only days that have actually elapsed count toward AVG/DAY.

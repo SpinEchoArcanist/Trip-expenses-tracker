@@ -1,10 +1,25 @@
 // Variables used by Scriptable.
 // These must be at the very top of the file. Do not edit.
 // icon-color: red; icon-glyph: magic;
-// VERSION 5.7 - 2026-05-07
+// VERSION 5.10 - 2026-08-08
 // ===================================================================
 //  VACATION EXPENSE TRACKER  -  ExpenseTracker.js
+//  + Trip name & description (NEW in 5.10):
+//    Short trip name replaces "Vacation Expenses" in the dashboard
+//    header (tappable — shows the full description in a popup, since
+//    the description is never displayed inline). Also reachable via
+//    Settings → Trip name & description. Both travel with JSON
+//    export/import (meta block), with mismatch confirmation mirroring
+//    the currency / trip-dates import flow.
 //  + Bulk Edit: WebView multi-select checklist, then apply to selection
+//  + Bulk Edit stays open across multiple edits: Scriptable can't
+//    force-close a presented WebView, so instead of ending the poll
+//    loop after one apply, the bulk screen reloads itself in place
+//    with fresh data after every change — same pattern as the main
+//    dashboard. Lets the user apply several bulk edits back to back
+//    without leaving the screen. A permanent close-reminder banner is
+//    shown in the header, and a dedicated goodbye screen appears once
+//    there's nothing left to do (Cancel, or all entries deleted).
 //  + Housing category (hotel / BnB)
 //  + Ghost Entry: exclude any entry from all stats (reversible)
 //  + Scroll position restored after every HTML reload
@@ -15,6 +30,18 @@
 //  + Bulk delete
 //  + Third currency: fully configurable in Settings (default: GBP)
 //    Change via Settings UI — no code modification needed.
+//  + Trip days counting for AVG/DAY:
+//    Option 2 (preferred): explicit Trip Dates (start/end) in Settings.
+//      Every calendar day in range counts toward the average, even
+//      zero-expense days. Entries outside the range are still shown
+//      in the entry list / BY DAY table but excluded from AVG/DAY,
+//      OVERALL, and category totals.
+//    Option 1 (fallback, used only when no Trip Dates are set):
+//      gap-fill zero-expense days between the earliest and latest
+//      past entry. Days before the first entry or after the last
+//      past entry cannot be inferred and are not counted.
+//    Today and future days are never counted in the average.
+//    Trip Dates travel with JSON export/import (meta block).
 //  Data stored in: iCloud Drive / Scriptable / expenses.json
 //  Settings in:    iCloud Drive / Scriptable / expense_settings.json
 // ===================================================================
@@ -68,6 +95,10 @@ function loadSettings() {
     cur3Name:        "British Pound",
     displayMode:     "ADAPTIVE",
     defaultCurrency: "CHF",
+    tripStart:       "",   // YYYY-MM-DD, "" = not set (auto gap-fill fallback)
+    tripEnd:         "",   // YYYY-MM-DD, "" = not set (auto gap-fill fallback)
+    tripName:        "",   // short display name, shown in dashboard/widget header
+    tripDescription: "",   // longer free text, only shown on demand (popup)
   };
   if (!fm.fileExists(settingsPath)) return defaults;
   try {
@@ -99,8 +130,7 @@ function loadData() {
   if (!fm.fileExists(dataPath)) return [];
   try {
     fm.downloadFileFromiCloud(dataPath);
-    const parsed = JSON.parse(fm.readString(dataPath));
-    return Array.isArray(parsed) ? parsed : [];
+    return JSON.parse(fm.readString(dataPath));
   } catch(e) { return []; }
 }
 
@@ -181,6 +211,87 @@ function sumInCurrency(dayEntries, cur, s) {
 function fmtDate(iso) {
   const [y, m, d] = iso.split("-");
   return `${d}/${m}/${y}`;
+}
+
+// Minimal HTML-escape for free-text user input (trip name/description)
+// embedded into the WebView HTML — prevents broken markup / stray tags.
+function escapeHtml(str) {
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// ==================================================================
+//  TRIP DATES  —  counting zero-expense days into the average
+//
+//  Two strategies, chosen automatically:
+//   - Option 2 (explicit): settings.tripStart / tripEnd define the
+//     trip window. Every day in [tripStart, boundEnd] counts toward
+//     nPastDays, whether or not it has entries. Entries outside the
+//     window are excluded from AVG/DAY, OVERALL and category totals
+//     (but remain visible in the entry list / BY DAY table).
+//   - Option 1 (fallback): used only when no valid trip range is set.
+//     Zero-expense days between the earliest and latest PAST entry
+//     are gap-filled and counted. Days before the first entry or
+//     after the last past entry cannot be inferred, so they are not
+//     counted — this is a known limitation of the fallback.
+//  In both cases, today and any future day are never counted.
+// ==================================================================
+function hasValidTripRange(s) {
+  return !!(s.tripStart && s.tripEnd &&
+    /^\d{4}-\d{2}-\d{2}$/.test(s.tripStart) &&
+    /^\d{4}-\d{2}-\d{2}$/.test(s.tripEnd) &&
+    s.tripStart <= s.tripEnd);
+}
+
+// When no valid trip range is set, every date is considered "in window"
+// (no filtering) so existing behaviour is preserved.
+function inTripWindow(dateStr, s) {
+  if (!hasValidTripRange(s)) return true;
+  return dateStr >= s.tripStart && dateStr <= s.tripEnd;
+}
+
+function addDaysStr(dateStr, n) {
+  const d = new Date(dateStr + "T12:00:00");
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+// Inclusive list of ISO date strings from startStr to endStr
+function enumerateDates(startStr, endStr) {
+  const out = [];
+  if (!startStr || !endStr || startStr > endStr) return out;
+  let cur = startStr;
+  let guard = 0;
+  while (cur <= endStr && guard < 3660) { // ~10yr safety cap
+    out.push(cur);
+    cur = addDaysStr(cur, 1);
+    guard++;
+  }
+  return out;
+}
+
+// Returns the list of past (never today/future) calendar dates that
+// should count toward nPastDays / AVG-DAY, including zero-expense days.
+function computeCountedPastDates(activeEntries, settings, today) {
+  const yesterday = addDaysStr(today, -1);
+
+  if (hasValidTripRange(settings)) {
+    // Option 2: explicit trip window, clipped so we never count today/future
+    const boundEnd = settings.tripEnd < today ? settings.tripEnd : yesterday;
+    if (settings.tripStart > boundEnd) return [];
+    return enumerateDates(settings.tripStart, boundEnd);
+  }
+
+  // Option 1 fallback: gap-fill between earliest and latest PAST entry date
+  const pastDates = [...new Set(
+    activeEntries.filter(e => e.date < today).map(e => e.date)
+  )].sort();
+  if (pastDates.length === 0) return [];
+  return enumerateDates(pastDates[0], pastDates[pastDates.length - 1]);
 }
 
 // ==================================================================
@@ -301,17 +412,25 @@ async function showSettings() {
 
   while (true) {
     const cur3Label = s.cur3Flag + " " + s.cur3Code + " (" + s.cur3Name + ")";
+    const tripLabel = hasValidTripRange(s)
+      ? fmtDate(s.tripStart) + " → " + fmtDate(s.tripEnd)
+      : "not set — auto (gap-fill)";
+    const nameLabel = s.tripName ? s.tripName : "not set";
     const a = new Alert();
     a.title   = "⚙️ Settings";
     a.message =
       "EUR rate: 1 CHF = " + s.chfToEur + " EUR\n" +
       "Third currency: " + cur3Label + "\n" +
       "Third rate: 1 CHF = " + s.chfToCur3 + " " + s.cur3Code + "\n" +
-      "Default currency: " + s.defaultCurrency;
+      "Default currency: " + s.defaultCurrency + "\n" +
+      "Trip dates: " + tripLabel + "\n" +
+      "Trip name: " + nameLabel;
     a.addAction("💱 EUR rate  (now: 1 CHF = " + s.chfToEur + " EUR)");
     a.addAction("🌍 Third currency  (now: " + cur3Label + ")");
     a.addAction("💹 Third currency rate  (now: 1 CHF = " + s.chfToCur3 + " " + s.cur3Code + ")");
     a.addAction("💶 Default currency for new entries  (now: " + s.defaultCurrency + ")");
+    a.addAction("🗓️ Trip dates  (now: " + tripLabel + ")");
+    a.addAction("🏷️ Trip name & description  (now: " + nameLabel + ")");
     a.addCancelAction("← Done");
 
     const choice = await a.presentAlert();
@@ -472,6 +591,166 @@ async function showSettings() {
       if (res === -1) continue;
       s.defaultCurrency = res === 2 ? s.cur3Code : res === 1 ? "EUR" : "CHF";
       saveSettings(s);
+
+    } else if (choice === 4) {
+      // Trip dates — defines the window used to count zero-expense days
+      // toward AVG/DAY. Leave empty to fall back to auto gap-fill.
+      const curLabel = hasValidTripRange(s)
+        ? fmtDate(s.tripStart) + " → " + fmtDate(s.tripEnd)
+        : "not set — auto (gap-fill)";
+      const t = new Alert();
+      t.title   = "🗓️ Trip Dates";
+      t.message =
+        "Current: " + curLabel + "\n\n" +
+        "When set, every day in this range counts toward AVG/DAY, even " +
+        "days with no expenses. Entries outside the range stay visible " +
+        "but are excluded from AVG/DAY, OVERALL and category totals.\n\n" +
+        "If left unset, days are auto-detected: zero-expense gaps between " +
+        "your first and last past entry are counted, but not the very " +
+        "first or last day of the trip.";
+      t.addAction("📅 Set start date");
+      t.addAction("📅 Set end date");
+      if (s.tripStart || s.tripEnd) t.addDestructiveAction("🗑️ Clear trip dates");
+      t.addCancelAction("← Back");
+      const tRes = await t.presentAlert();
+      if (tRes === -1) continue;
+
+      if (tRes === 0 || tRes === 1) {
+        const isStart = tRes === 0;
+        const d = new Alert();
+        d.title   = isStart ? "📅 Trip start date  (YYYY-MM-DD)" : "📅 Trip end date  (YYYY-MM-DD)";
+        d.message = "Example: " + todayStr();
+        d.addTextField("YYYY-MM-DD", isStart ? s.tripStart : s.tripEnd);
+        d.addAction("Save ✓");
+        d.addCancelAction("← Back");
+        if (await d.presentAlert() === -1) continue;
+        const val = d.textFieldValue(0).trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+          const err = new Alert();
+          err.title = "Invalid date";
+          err.message = "Use YYYY-MM-DD. Example: " + todayStr();
+          err.addAction("OK");
+          await err.presentAlert(); continue;
+        }
+        if (isStart) s.tripStart = val; else s.tripEnd = val;
+
+        // If both dates are set but out of order, warn and don't save yet
+        if (s.tripStart && s.tripEnd && s.tripStart > s.tripEnd) {
+          const err = new Alert();
+          err.title   = "Start is after end";
+          err.message = "Trip start (" + fmtDate(s.tripStart) + ") must be on or before trip end (" + fmtDate(s.tripEnd) + ").";
+          err.addAction("OK");
+          await err.presentAlert();
+          if (isStart) s.tripStart = ""; else s.tripEnd = "";
+          continue;
+        }
+        saveSettings(s);
+
+      } else if (tRes === 2) {
+        // Clear
+        s.tripStart = "";
+        s.tripEnd   = "";
+        saveSettings(s);
+      }
+
+    } else if (choice === 5) {
+      await editTripNameFlow(s);
+    }
+  }
+}
+
+// ==================================================================
+//  TRIP NAME & DESCRIPTION
+//
+//  Name: short text, replaces "Vacation Expenses" in the dashboard
+//  header and (once updated) the large widget header.
+//  Description: longer free text, shown ONLY on demand — via the
+//  popup below (tap the dashboard title) or the Settings entry point.
+//  Scriptable's Alert text fields are single-line, so the description
+//  is entered as one line of free text (no manual line breaks).
+// ==================================================================
+
+// Popup shown when tapping the dashboard title, or reachable via
+// Settings → Trip name & description.
+async function showTripInfo(settings) {
+  const s    = loadSettings();
+  const name = (s.tripName || "").trim();
+  const desc = (s.tripDescription || "").trim();
+
+  const a = new Alert();
+  a.title   = name || "✈️ Vacation Expenses";
+  a.message = desc || "No description added yet.";
+  a.addAction("✏️ Edit name / description");
+  a.addCancelAction("Close");
+  const res = await a.presentAlert();
+  if (res === 0) {
+    await editTripNameFlow(s);
+  }
+}
+
+// Shared edit flow — used from the trip-info popup's Edit button and
+// from Settings directly.
+async function editTripNameFlow(s) {
+  while (true) {
+    const nameLabel = s.tripName ? s.tripName : "not set";
+    const descLabel = s.tripDescription
+      ? (s.tripDescription.length > 40 ? s.tripDescription.slice(0, 40) + "…" : s.tripDescription)
+      : "not set";
+
+    const a = new Alert();
+    a.title   = "🏷️ Trip Name & Description";
+    a.message =
+      "Name: " + nameLabel + "\n" +
+      "Description: " + descLabel + "\n\n" +
+      "The name replaces \"Vacation Expenses\" at the top of the dashboard and widget. " +
+      "The description is only shown when you tap the title or open it here.";
+    a.addAction("✏️ Set name");
+    a.addAction("📝 Set description");
+    if (s.tripName || s.tripDescription) a.addDestructiveAction("🗑️ Clear both");
+    a.addCancelAction("← Back");
+    const choice = await a.presentAlert();
+    if (choice === -1) return;
+
+    if (choice === 0) {
+      const d = new Alert();
+      d.title   = "✏️ Trip name";
+      d.message = "Short text shown at the top of the dashboard and widget. Example: \"Rome getaway\"";
+      d.addTextField("e.g. Rome getaway", s.tripName || "");
+      d.addAction("Save ✓");
+      d.addCancelAction("← Back");
+      if (await d.presentAlert() === -1) continue;
+      const val = d.textFieldValue(0).trim();
+      if (val.length > 60) {
+        const warn = new Alert();
+        warn.title   = "Name too long";
+        warn.message = "Please keep the trip name under 60 characters (currently " + val.length + ").";
+        warn.addAction("OK");
+        await warn.presentAlert();
+        continue;
+      }
+      s.tripName = val;
+      saveSettings(s);
+
+    } else if (choice === 1) {
+      const d = new Alert();
+      d.title   = "📝 Trip description";
+      d.message = "Longer free text — only shown when you tap the trip name or open it here. Not shown on the dashboard directly.";
+      d.addTextField("e.g. Anniversary trip, staying near Trastevere...", s.tripDescription || "");
+      d.addAction("Save ✓");
+      d.addCancelAction("← Back");
+      if (await d.presentAlert() === -1) continue;
+      s.tripDescription = d.textFieldValue(0).trim();
+      saveSettings(s);
+
+    } else if (choice === 2 && (s.tripName || s.tripDescription)) {
+      const confirm = new Alert();
+      confirm.title = "🗑️ Clear trip name & description?";
+      confirm.addDestructiveAction("Yes, clear");
+      confirm.addCancelAction("Cancel");
+      if (await confirm.presentAlert() === -1) continue;
+      s.tripName        = "";
+      s.tripDescription = "";
+      saveSettings(s);
     }
   }
 }
@@ -530,6 +809,9 @@ async function runPollLoop(wv, settings) {
       await exportCSV();
     } else if (action === "settings") {
       await showSettings();
+      Object.assign(settings, loadSettings());
+    } else if (action === "tripInfo") {
+      await showTripInfo(settings);
       Object.assign(settings, loadSettings());
     } else if (action === "bulkEdit") {
       await bulkEditEntries();
@@ -591,13 +873,28 @@ function buildDashboardHTML(settings) {
   // Resolve stored "CUR3" placeholder to actual cur3Code for backward compat
   const resolvedMode = (initialMode === "CUR3") ? cur3Code : initialMode;
 
+  const tripName        = (settings.tripName || "").trim();
+  const tripDescription = (settings.tripDescription || "").trim();
+  const headerTitle      = tripName ? escapeHtml(tripName) : "\u2708\uFE0F Vacation Expenses";
+  const headerTitleClass = tripName || tripDescription ? "header-title tappable" : "header-title";
+  const headerInfoDot    = (tripName || tripDescription) ? " <span class=\"info-dot\">\u24D8</span>" : "";
+
   const allEntries = loadData();
   const today      = todayStr();
 
   const activeEntries = allEntries.filter(e => !e.ghost);
   const todayEntries  = activeEntries.filter(e => e.date === today);
-  const pastEntries   = activeEntries.filter(e => e.date !== today);
-  const nPastDays     = [...new Set(pastEntries.map(e => e.date))].length;
+
+  // Trip-window-aware day counting (see helpers above for Option 1 vs 2).
+  const countedPastDates = computeCountedPastDates(activeEntries, settings, today);
+  const nPastDays        = countedPastDates.length;
+
+  // tripActiveEntries feed AVG/DAY, OVERALL and category totals. When a
+  // valid Trip Dates range is set, entries outside it are excluded here
+  // but remain visible in the entry list / BY DAY table. When no range
+  // is set, inTripWindow() is a no-op and this equals activeEntries.
+  const tripActiveEntries = activeEntries.filter(e => inTripWindow(e.date, settings));
+  const pastEntries       = tripActiveEntries.filter(e => e.date !== today);
 
   const CAT_COLORS = {};
   const CAT_SHORT  = {};
@@ -626,16 +923,19 @@ function buildDashboardHTML(settings) {
     entryRowsHtml = "<tr><td colspan=\"5\" class=\"dim\" style=\"text-align:center;padding:16px\">No entries yet</td></tr>";
   } else {
     sortedDays.forEach(d => {
-      const isToday  = d === today;
+      const isToday   = d === today;
+      const isOutside = !isToday && hasValidTripRange(settings) && !inTripWindow(d, settings);
       const DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
       const weekday = DAYS[new Date(d + "T12:00:00").getDay()];
       const dayLabel = isToday
         ? "<strong>" + weekday + " " + fmtDate(d) + "</strong> <span class=\"badge\">today</span>"
-        : weekday + " " + fmtDate(d);
+        : isOutside
+          ? weekday + " " + fmtDate(d) + " <span class=\"badge badge-outside\">outside trip</span>"
+          : weekday + " " + fmtDate(d);
       const dayId  = "dh_" + d.replace(/-/g, "");
       const dayKey = d.replace(/-/g, "");
       entryRowsHtml +=
-        "<tr class=\"day-header-row\" onclick=\"toggleDay('" + dayKey + "')\">" +
+        "<tr class=\"day-header-row" + (isOutside ? " outside-trip" : "") + "\" onclick=\"toggleDay('" + dayKey + "')\">" +
         "<td colspan=\"4\">" + dayLabel + "</td>" +
         "<td id=\"" + dayId + "tot\" class=\"" + (isToday ? "green" : "yellow") + " right\">…" +
         "<span id=\"" + dayId + "chev\" style=\"margin-left:6px;font-size:0.667rem;color:#8FA3B0\">&#9660;</span></td>" +
@@ -672,7 +972,55 @@ function buildDashboardHTML(settings) {
     });
   }
 
-  const overallDomCur = dominantCurrency(activeEntries, settings);
+  const overallDomCur = dominantCurrency(tripActiveEntries, settings);
+
+  // Real days (with at least one active entry) — each tagged with whether
+  // it falls inside the trip window (only meaningful when one is set).
+  const realDays = activeSortedDays.map(d => {
+    const dayEnts = activeByDay[d];
+    const domCur  = dominantCurrency(dayEnts, settings);
+    const catChf  = {};
+    CATEGORIES.forEach(c => { catChf[c.label] = 0; });
+    dayEnts.forEach(e => {
+      if (catChf[e.category] !== undefined)
+        catChf[e.category] += toCHF(e.amount, e.currency || "CHF", settings);
+    });
+    return {
+      date:        d,
+      isToday:     d === today,
+      isZeroDay:   false,
+      inWindow:    inTripWindow(d, settings),
+      domCur,
+      nativeTotal: sumInCurrency(dayEnts, domCur, settings),
+      entries:     dayEnts.map(e => ({ amount: e.amount, currency: e.currency || "CHF" })),
+      catChf,
+    };
+  });
+
+  // Synthetic zero-expense days that are counted toward nPastDays but have
+  // no actual entries — shown in BY DAY as "no expenses" so the saved days
+  // are visible, not just silently baked into the average.
+  const zeroCatChf = {};
+  CATEGORIES.forEach(c => { zeroCatChf[c.label] = 0; });
+  const zeroDays = countedPastDates
+    .filter(d => !activeByDay[d])
+    .map(d => ({
+      date: d, isToday: false, isZeroDay: true, inWindow: true,
+      domCur: "CHF", nativeTotal: 0, entries: [], catChf: zeroCatChf,
+    }));
+
+  const days = realDays.concat(zeroDays)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+
+  // Small subtitle explaining which day-counting strategy is active
+  let tripRangeLabel = "";
+  if (hasValidTripRange(settings)) {
+    tripRangeLabel = "\uD83D\uDDD3\uFE0F Trip: " + fmtDate(settings.tripStart) + " \u2013 " + fmtDate(settings.tripEnd) +
+      "  \u00B7  " + nPastDays + " day" + (nPastDays === 1 ? "" : "s") + " counted";
+  } else if (nPastDays > 0) {
+    tripRangeLabel = "\uD83D\uDDD3\uFE0F Auto range (gaps counted)  \u00B7  " + nPastDays + " day" + (nPastDays === 1 ? "" : "s") +
+      " so far \u2014 set Trip Dates in Settings for full accuracy";
+  }
 
   const embeddedData = JSON.stringify({
     chfToEur,
@@ -686,34 +1034,18 @@ function buildDashboardHTML(settings) {
     initialMode:  resolvedMode,
     today,
     nPastDays,
-    days: activeSortedDays.map(d => {
-      const dayEnts = activeByDay[d];
-      const domCur  = dominantCurrency(dayEnts, settings);
-      const catChf  = {};
-      CATEGORIES.forEach(c => { catChf[c.label] = 0; });
-      dayEnts.forEach(e => {
-        if (catChf[e.category] !== undefined)
-          catChf[e.category] += toCHF(e.amount, e.currency || "CHF", settings);
-      });
-      return {
-        date:        d,
-        isToday:     d === today,
-        domCur,
-        nativeTotal: sumInCurrency(dayEnts, domCur, settings),
-        entries:     dayEnts.map(e => ({ amount: e.amount, currency: e.currency || "CHF" })),
-        catChf,
-      };
-    }),
+    tripRangeLabel,
+    days,
     categories: CATEGORIES.map(c => {
       const dailyChf   = todayEntries.filter(e => e.category === c.label)
         .reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0);
       const pastChf    = pastEntries.filter(e => e.category === c.label)
         .reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0);
-      const overallChf = activeEntries.filter(e => e.category === c.label)
+      const overallChf = tripActiveEntries.filter(e => e.category === c.label)
         .reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0);
       return { label: c.label, short: CAT_SHORT[c.label] || c.label, color: c.color, dailyChf, pastChf, overallChf };
     }),
-    totalAllChf:   activeEntries.reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0),
+    totalAllChf:   tripActiveEntries.reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0),
     totalTodayChf: todayEntries.reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0),
     pastTotalChf:  pastEntries.reduce((s, e) => s + toCHF(e.amount, e.currency || "CHF", settings), 0),
     prevDomCur: (activeSortedDays.length > 0 && activeSortedDays[0] !== today && activeByDay[activeSortedDays[0]])
@@ -751,6 +1083,9 @@ function buildDashboardHTML(settings) {
 "  body { width: 100%; font-family: -apple-system, sans-serif; background: #0F1923; color: #fff; padding: 0 0 32px 0; font-size: 1rem; }\n" +
 "  .header { position: sticky; top: 0; background: #0F1923; padding: 14px 16px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); z-index: 10; display: flex; align-items: center; justify-content: space-between; }\n" +
 "  .header-title { font-size: 1.067rem; font-weight: 700; color: #8FA3B0; }\n" +
+"  .header-title.tappable { cursor: pointer; }\n" +
+"  .header-title.tappable:active { opacity: 0.6; }\n" +
+"  .header-title .info-dot { font-size: 0.7rem; color: rgba(255,209,102,0.7); margin-left: 4px; }\n" +
 "  .header-date  { font-size: 0.8rem; color: #8FA3B0; margin-top: 2px; }\n" +
 "  .mode-btn { background: rgba(255,255,255,0.10); border: 1px solid rgba(255,255,255,0.15); border-radius: 10px; color: #FFD166; font-size: 0.8rem; font-weight: 700; padding: 5px 10px; white-space: nowrap; }\n" +
 "  .mode-btn:active { background: rgba(255,209,102,0.25); }\n" +
@@ -786,6 +1121,12 @@ function buildDashboardHTML(settings) {
 "  .bar-bg { background: rgba(255,255,255,0.08); border-radius: 3px; height: 5px; width: 60px; overflow: hidden; }\n" +
 "  .bar-fill { height: 100%; border-radius: 3px; }\n" +
 "  .badge { background: rgba(6,214,160,0.2); color: #06D6A0; font-size: 0.667rem; font-weight: 700; padding: 2px 6px; border-radius: 4px; margin-left: 6px; vertical-align: middle; }\n" +
+"  .badge-outside { background: rgba(255,255,255,0.08); color: #8FA3B0; }\n" +
+"  .day-header-row.outside-trip td { opacity: 0.55; }\n" +
+"  .trip-note { font-size: 0.667rem; color: rgba(255,209,102,0.75); text-align: center; padding: 3px 16px 0; }\n" +
+"  .zero-day-row td { color: #8FA3B0; font-style: italic; }\n" +
+"  .zero-day-row .day-tbl-date { opacity: 0.7; }\n" +
+"  .outside-day-row td { opacity: 0.55; }\n" +
 "  .col-header { font-size: 0.667rem; font-weight: 700; letter-spacing: 0.4px; padding-bottom: 4px !important; border-bottom: 1px solid rgba(255,255,255,0.1) !important; }\n" +
 "  .col-header.green  { color: #06D6A0; }\n" +
 "  .col-header.purple { color: #A78BFA; }\n" +
@@ -812,7 +1153,7 @@ function buildDashboardHTML(settings) {
 "</head>\n<body>\n" +
 "<div class=\"header\">\n" +
 "  <div>\n" +
-"    <div class=\"header-title\">\u2708\uFE0F Vacation Expenses</div>\n" +
+"    <div class=\"" + headerTitleClass + "\"" + ((tripName || tripDescription) ? " onclick=\"done('tripInfo')\"" : "") + ">" + headerTitle + headerInfoDot + "</div>\n" +
 "    <div class=\"header-date\">" + fmtDate(today) + "</div>\n" +
 "  </div>\n" +
 "  <button class=\"mode-btn\" id=\"modeBtn\" onclick=\"cycleMode()\">\u2026</button>\n" +
@@ -832,6 +1173,7 @@ function buildDashboardHTML(settings) {
 "  </div>\n" +
 "</div>\n" +
 "<p class=\"rate-note\" id=\"rateNote\"></p>\n" +
+"<p class=\"trip-note\" id=\"tripNote\"></p>\n" +
 "<div class=\"section\" style=\"margin-top:12px\">\n" +
 "  <div class=\"section-title\" onclick=\"toggleSection('cat')\">\n" +
 "    <span>BY CATEGORY</span><span class=\"section-chevron\" id=\"chev-cat\">&#9660;</span>\n" +
@@ -946,6 +1288,7 @@ function buildDashboardHTML(settings) {
 "  document.getElementById('modeBtn').textContent = MODE_LABELS_BASE[mode] || mode;\n" +
 "  document.getElementById('rateNote').textContent =\n" +
 "    '1 CHF = ' + D.chfToEur + ' EUR  \u00B7  1 CHF = ' + D.chfToCur3 + ' ' + D.cur3Code + '  \u00B7  ' + (MODE_LABELS_BASE[mode] || mode);\n" +
+"  document.getElementById('tripNote').textContent = D.tripRangeLabel || '';\n" +
 "\n" +
 "  var todayDay  = D.days.length > 0 && D.days[0].isToday ? D.days[0] : null;\n" +
 "  var todayCur  = fixedCur || (todayDay ? todayDay.domCur : D.prevDomCur);\n" +
@@ -1012,31 +1355,42 @@ function buildDashboardHTML(settings) {
 "    var dCur      = fixedCur || d.domCur;\n" +
 "    var dispTotal = fixedCur ? nativeSumForDay(d.entries, dCur) : d.nativeTotal;\n" +
 "    var isToday   = d.isToday;\n" +
+"    var isZero    = !!d.isZeroDay;\n" +
+"    var isOutside = !isToday && !isZero && d.inWindow === false;\n" +
 "    var WDAYS     = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];\n" +
 "    var MONTHS    = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];\n" +
 "    var dp        = d.date.split('-');\n" +
 "    var weekday   = WDAYS[new Date(d.date + 'T12:00:00').getDay()];\n" +
 "    var shortDate = weekday + ' ' + dp[2] + ' ' + MONTHS[parseInt(dp[1]) - 1];\n" +
-"    var label     = isToday ? '<strong>' + shortDate + '</strong>' : shortDate;\n" +
+"    var suffix    = isZero ? ' <span class=\"dim\" style=\"font-size:0.733rem\">(no expenses)</span>' : (isOutside ? ' <span class=\"badge badge-outside\">outside trip</span>' : '');\n" +
+"    var label     = (isToday ? '<strong>' + shortDate + '</strong>' : shortDate) + suffix;\n" +
 "    var valCls    = isToday ? 'green' : 'yellow';\n" +
-"    var row = \"<tr class='\" + (isToday ? 'today-row' : '') + \"'>\";\n" +
+"    var rowCls    = isToday ? 'today-row' : (isZero ? 'zero-day-row' : (isOutside ? 'outside-day-row' : ''));\n" +
+"    var row = \"<tr class='\" + rowCls + \"'>\";\n" +
 "    row += \"<td class='day-tbl-date'>\" + label + '</td>';\n" +
-"    D.categories.forEach(function(c) {\n" +
-"      var chfAmt  = (d.catChf && d.catChf[c.label]) ? d.catChf[c.label] : 0;\n" +
-"      var dispAmt = fromChf(chfAmt, dCur);\n" +
-"      row += \"<td class='day-tbl-cat \" + (chfAmt > 0 ? valCls : 'dim') + \"'>\" +\n" +
-"        (chfAmt > 0 ? fmtIn(dispAmt, dCur) : '-') + '</td>';\n" +
-"    });\n" +
-"    row += \"<td class='day-tbl-total \" + valCls + \"'>\" + fmtIn(dispTotal, dCur) + '</td>';\n" +
+"    if (isZero) {\n" +
+"      D.categories.forEach(function() { row += \"<td class='day-tbl-cat dim'>-</td>\"; });\n" +
+"      row += \"<td class='day-tbl-total dim'>-</td>\";\n" +
+"    } else {\n" +
+"      D.categories.forEach(function(c) {\n" +
+"        var chfAmt  = (d.catChf && d.catChf[c.label]) ? d.catChf[c.label] : 0;\n" +
+"        var dispAmt = fromChf(chfAmt, dCur);\n" +
+"        row += \"<td class='day-tbl-cat \" + (chfAmt > 0 ? valCls : 'dim') + \"'>\" +\n" +
+"          (chfAmt > 0 ? fmtIn(dispAmt, dCur) : '-') + '</td>';\n" +
+"      });\n" +
+"      row += \"<td class='day-tbl-total \" + valCls + \"'>\" + fmtIn(dispTotal, dCur) + '</td>';\n" +
+"    }\n" +
 "    row += '</tr>';\n" +
 "    dayHtml += row;\n" +
-"    var dayTot = D.dayActiveTotals[d.date];\n" +
-"    var el = document.getElementById('dh_' + d.date.replace(/-/g,'') + 'tot');\n" +
-"    if (el && dayTot) {\n" +
-"      var showCur = fixedCur || dayTot.cur;\n" +
-"      var showVal = fixedCur ? fromChf(toChf(dayTot.total, dayTot.cur), fixedCur) : dayTot.total;\n" +
-"      el.childNodes[0].textContent = fmtIn(showVal, showCur);\n" +
-"      el.className = valCls + ' right';\n" +
+"    if (!isZero) {\n" +
+"      var dayTot = D.dayActiveTotals[d.date];\n" +
+"      var el = document.getElementById('dh_' + d.date.replace(/-/g,'') + 'tot');\n" +
+"      if (el && dayTot) {\n" +
+"        var showCur = fixedCur || dayTot.cur;\n" +
+"        var showVal = fixedCur ? fromChf(toChf(dayTot.total, dayTot.cur), fixedCur) : dayTot.total;\n" +
+"        el.childNodes[0].textContent = fmtIn(showVal, showCur);\n" +
+"        el.className = valCls + ' right';\n" +
+"      }\n" +
 "    }\n" +
 "  });\n" +
 "  document.getElementById('dayBody').innerHTML = headHtml + dayHtml;\n" +
@@ -1244,9 +1598,17 @@ async function editEntry(entries, idx, settings) {
 
 // ==================================================================
 //  BULK EDIT
+//
+//  Scriptable cannot force-close a presented WebView from code — only
+//  a native "Close" tap by the user can do that. So, exactly like the
+//  main dashboard's poll loop, this screen is presented ONCE and then
+//  simply reloads its own HTML in place after every apply, showing
+//  the freshly saved data immediately and letting the user select and
+//  apply another bulk edit right away — no need to close and reopen.
+//  The loop only exits if the WebView itself becomes unresponsive.
 // ==================================================================
 async function bulkEditEntries() {
-  const entries  = loadData();
+  let entries = loadData();
   const settings = loadSettings();
   if (entries.length === 0) {
     const a = new Alert(); a.title = "No entries"; a.addAction("OK");
@@ -1256,147 +1618,179 @@ async function bulkEditEntries() {
   const wv = new WebView();
   await wv.loadHTML(buildBulkHTML(entries));
 
-  let resultField   = null;
-  let resultIndices = [];
-
   await Promise.race([
     wv.present(true),
-    (async () => {
-      while (true) {
-        await new Promise(r => Timer.schedule(300, false, r));
-        let act;
-        try { act = await wv.evaluateJavaScript("typeof _action !== 'undefined' ? _action : null"); }
-        catch(_) { return; }
-        if (!act || act === "null") continue;
-        try { await wv.evaluateJavaScript("_action = null"); } catch(_) { return; }
-
-        if (act === "bulkClose") return;
-
-        if (typeof act === "string" && act.startsWith("bulkApply:")) {
-          const parts   = act.split(":");
-          const field   = parts[1];
-          const idxList = parts[2] ? parts[2].split(",").map(Number) : [];
-          if (idxList.length === 0) {
-            const w = new Alert();
-            w.title   = "Nothing selected";
-            w.message = "Tap the checkboxes next to the entries you want to edit.";
-            w.addAction("OK");
-            await w.presentAlert();
-            continue;
-          }
-          resultField   = field;
-          resultIndices = idxList;
-          return;
-        }
-      }
-    })(),
+    runBulkPollLoop(wv, entries, settings),
   ]);
+}
 
-  if (!resultField || resultIndices.length === 0) return;
+async function runBulkPollLoop(wv, entries, settings) {
+  while (true) {
+    await new Promise(r => Timer.schedule(300, false, r));
 
-  let applyFn = null;
+    let act;
+    try { act = await wv.evaluateJavaScript("typeof _action !== 'undefined' ? _action : null"); }
+    catch(_) { return; } // WebView is gone — nothing more we can do
 
-  if (resultField === "category") {
-    const a = new Alert();
-    a.title   = "📂 New category";
-    a.message = "Apply to " + resultIndices.length + " selected " + (resultIndices.length === 1 ? "entry" : "entries");
-    CATEGORIES.forEach(c => a.addAction(c.label));
-    a.addCancelAction("Cancel");
-    const res = await a.presentAlert();
-    if (res === -1) return;
-    const newCat = CATEGORIES[res].label;
-    applyFn = e => { e.category = newCat; };
+    if (!act || act === "null") continue;
+    try { await wv.evaluateJavaScript("_action = null"); } catch(_) { return; }
 
-  } else if (resultField === "currency") {
-    const a = new Alert();
-    a.title   = "💱 New currency";
-    a.message = "Apply to " + resultIndices.length + " selected " + (resultIndices.length === 1 ? "entry" : "entries") + "\n\nAmounts are NOT converted — only the currency label changes.";
-    a.addAction("🇪🇺 EUR");
-    a.addAction("🇨🇭 CHF");
-    a.addAction(settings.cur3Flag + " " + settings.cur3Code);
-    a.addCancelAction("Cancel");
-    const res = await a.presentAlert();
-    if (res === -1) return;
-    const newCur = res === 2 ? settings.cur3Code : res === 1 ? "CHF" : "EUR";
-    applyFn = e => { e.currency = newCur; };
-
-  } else if (resultField === "ghost") {
-    const a = new Alert();
-    a.title   = "👻 Ghost status";
-    a.message = "Apply to " + resultIndices.length + " selected " + (resultIndices.length === 1 ? "entry" : "entries");
-    a.addAction("👻 Exclude from stats");
-    a.addAction("✅ Restore to stats");
-    a.addCancelAction("Cancel");
-    const res = await a.presentAlert();
-    if (res === -1) return;
-    const makeGhost = res === 0;
-    applyFn = e => { if (makeGhost) e.ghost = true; else delete e.ghost; };
-
-  } else if (resultField === "date") {
-    const a = new Alert();
-    a.title   = "📅 Move to date  (YYYY-MM-DD)";
-    a.message = "Move " + resultIndices.length + " selected " + (resultIndices.length === 1 ? "entry" : "entries") + " to this date";
-    a.addTextField("YYYY-MM-DD", entries[resultIndices[0]].date);
-    a.addAction("Apply ✓");
-    a.addCancelAction("Cancel");
-    if (await a.presentAlert() === -1) return;
-    const val = a.textFieldValue(0).trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
-      const err = new Alert();
-      err.title = "Invalid date"; err.message = "Use YYYY-MM-DD. Example: 2026-07-14";
-      err.addAction("OK"); await err.presentAlert(); return;
+    if (act === "bulkClose") {
+      // Nothing left to apply — swap the list for a short goodbye
+      // screen so stale checkboxes don't linger. We still can't force
+      // the window shut, so this repeats the native-Close reminder.
+      try { await wv.loadHTML(buildBulkCloseHTML()); } catch(_) { return; }
+      continue; // keep polling harmlessly; nothing more will fire here
     }
-    applyFn = e => { e.date = val; };
 
-  } else if (resultField === "delete") {
-    const previewDel = resultIndices.slice(0, 5).map(i => {
+    if (typeof act === "string" && act.startsWith("bulkApply:")) {
+      const parts   = act.split(":");
+      const field   = parts[1];
+      const idxList = parts[2] ? parts[2].split(",").map(Number) : [];
+
+      if (idxList.length === 0) {
+        const w = new Alert();
+        w.title   = "Nothing selected";
+        w.message = "Tap the checkboxes next to the entries you want to edit.";
+        w.addAction("OK");
+        await w.presentAlert();
+        continue; // list unchanged, no reload needed
+      }
+
+      // Capture scroll position before running alerts / reloading
+      let scrollY = 0;
+      try { scrollY = await wv.evaluateJavaScript("window.scrollY || 0"); } catch(_) {}
+
+      // entries is mutated in place (splice for delete, field assignment
+      // otherwise) and saved to disk inside runBulkFieldFlow.
+      await runBulkFieldFlow(field, idxList, entries, settings);
+
+      if (entries.length === 0) {
+        try { await wv.loadHTML(buildBulkCloseHTML("All entries have been processed.")); } catch(_) { return; }
+        continue;
+      }
+
+      try {
+        await wv.loadHTML(buildBulkHTML(entries));
+        if (scrollY > 0) {
+          await new Promise(r => Timer.schedule(80, false, r));
+          try { await wv.evaluateJavaScript(`window.scrollTo(0, ${scrollY})`); } catch(_) {}
+        }
+      } catch(_) { return; }
+      // loop continues — ready for another bulk edit on the same screen
+    }
+  }
+}
+
+// Runs the value-picker + confirm + apply flow for one bulk action.
+// Mutates `entries` in place and saves to disk on success; leaves it
+// untouched if the user cancels at any step. Returns true if applied.
+async function runBulkFieldFlow(field, idxList, entries, settings) {
+  if (field === "delete") {
+    const previewDel = idxList.slice(0, 5).map(i => {
       const e = entries[i];
       return "  " + fmtDate(e.date) + "  " + fmtNative(e.amount, e.currency || "EUR", settings) + "  " + e.description;
     });
-    if (resultIndices.length > 5) previewDel.push("  ... and " + (resultIndices.length - 5) + " more");
+    if (idxList.length > 5) previewDel.push("  ... and " + (idxList.length - 5) + " more");
 
     const confirmDel = new Alert();
-    confirmDel.title   = "🗑️ Delete " + resultIndices.length + " " + (resultIndices.length === 1 ? "entry" : "entries") + "?";
+    confirmDel.title   = "🗑️ Delete " + idxList.length + " " + (idxList.length === 1 ? "entry" : "entries") + "?";
     confirmDel.message = "This cannot be undone:\n\n" + previewDel.join("\n");
     confirmDel.addDestructiveAction("Yes, delete");
     confirmDel.addCancelAction("Cancel");
-    if (await confirmDel.presentAlert() === -1) return;
+    if (await confirmDel.presentAlert() === -1) return false;
 
-    const sortedDesc = [...resultIndices].sort((a, b) => b - a);
+    const sortedDesc = [...idxList].sort((a, b) => b - a);
     sortedDesc.forEach(i => entries.splice(i, 1));
     saveData(entries);
 
     const doneDel = new Alert();
     doneDel.title   = "🗑️ Deleted!";
-    doneDel.message = resultIndices.length + " " + (resultIndices.length === 1 ? "entry" : "entries") + " removed.";
+    doneDel.message = idxList.length + " " + (idxList.length === 1 ? "entry" : "entries") + " removed.";
     doneDel.addAction("OK");
     await doneDel.presentAlert();
-    return;
+    return true;
   }
 
-  if (!applyFn) return;
+  let applyFn = null;
 
-  const previewLines = resultIndices.slice(0, 5).map(i => {
+  if (field === "category") {
+    const a = new Alert();
+    a.title   = "📂 New category";
+    a.message = "Apply to " + idxList.length + " selected " + (idxList.length === 1 ? "entry" : "entries");
+    CATEGORIES.forEach(c => a.addAction(c.label));
+    a.addCancelAction("Cancel");
+    const res = await a.presentAlert();
+    if (res === -1) return false;
+    const newCat = CATEGORIES[res].label;
+    applyFn = e => { e.category = newCat; };
+
+  } else if (field === "currency") {
+    const a = new Alert();
+    a.title   = "💱 New currency";
+    a.message = "Apply to " + idxList.length + " selected " + (idxList.length === 1 ? "entry" : "entries") + "\n\nAmounts are NOT converted — only the currency label changes.";
+    a.addAction("🇪🇺 EUR");
+    a.addAction("🇨🇭 CHF");
+    a.addAction(settings.cur3Flag + " " + settings.cur3Code);
+    a.addCancelAction("Cancel");
+    const res = await a.presentAlert();
+    if (res === -1) return false;
+    const newCur = res === 2 ? settings.cur3Code : res === 1 ? "CHF" : "EUR";
+    applyFn = e => { e.currency = newCur; };
+
+  } else if (field === "ghost") {
+    const a = new Alert();
+    a.title   = "👻 Ghost status";
+    a.message = "Apply to " + idxList.length + " selected " + (idxList.length === 1 ? "entry" : "entries");
+    a.addAction("👻 Exclude from stats");
+    a.addAction("✅ Restore to stats");
+    a.addCancelAction("Cancel");
+    const res = await a.presentAlert();
+    if (res === -1) return false;
+    const makeGhost = res === 0;
+    applyFn = e => { if (makeGhost) e.ghost = true; else delete e.ghost; };
+
+  } else if (field === "date") {
+    const a = new Alert();
+    a.title   = "📅 Move to date  (YYYY-MM-DD)";
+    a.message = "Move " + idxList.length + " selected " + (idxList.length === 1 ? "entry" : "entries") + " to this date";
+    a.addTextField("YYYY-MM-DD", entries[idxList[0]].date);
+    a.addAction("Apply ✓");
+    a.addCancelAction("Cancel");
+    if (await a.presentAlert() === -1) return false;
+    const val = a.textFieldValue(0).trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+      const err = new Alert();
+      err.title = "Invalid date"; err.message = "Use YYYY-MM-DD. Example: 2026-07-14";
+      err.addAction("OK"); await err.presentAlert(); return false;
+    }
+    applyFn = e => { e.date = val; };
+  }
+
+  if (!applyFn) return false;
+
+  const previewLines = idxList.slice(0, 5).map(i => {
     const e = entries[i];
     return "  " + fmtDate(e.date) + "  " + fmtNative(e.amount, e.currency || "EUR", settings) + "  " + e.description;
   });
-  if (resultIndices.length > 5) previewLines.push("  ... and " + (resultIndices.length - 5) + " more");
+  if (idxList.length > 5) previewLines.push("  ... and " + (idxList.length - 5) + " more");
 
   const confirm = new Alert();
   confirm.title   = "✏️ Confirm Bulk Edit";
-  confirm.message = resultIndices.length + " " + (resultIndices.length === 1 ? "entry" : "entries") + " will be updated:\n\n" + previewLines.join("\n");
+  confirm.message = idxList.length + " " + (idxList.length === 1 ? "entry" : "entries") + " will be updated:\n\n" + previewLines.join("\n");
   confirm.addAction("Apply ✓");
   confirm.addCancelAction("Cancel");
-  if (await confirm.presentAlert() === -1) return;
+  if (await confirm.presentAlert() === -1) return false;
 
-  resultIndices.forEach(i => applyFn(entries[i]));
+  idxList.forEach(i => applyFn(entries[i]));
   saveData(entries);
 
   const done = new Alert();
   done.title   = "✅ Done!";
-  done.message = resultIndices.length + " " + (resultIndices.length === 1 ? "entry" : "entries") + " updated.";
+  done.message = idxList.length + " " + (idxList.length === 1 ? "entry" : "entries") + " updated.";
   done.addAction("OK");
   await done.presentAlert();
+  return true;
 }
 
 // ==================================================================
@@ -1460,6 +1854,8 @@ function buildBulkHTML(entries) {
 "  .top-bar { position: sticky; top: 0; background: #0F1923; padding: 14px 16px 10px; border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; z-index: 20; }\n" +
 "  .top-title { font-size: 1.067rem; font-weight: 700; color: #C8D8E4; }\n" +
 "  .top-count { font-size: 0.8rem; color: #FFD166; font-weight: 700; min-width: 60px; text-align: right; }\n" +
+"  .close-reminder { font-size: 0.7rem; color: #8FA3B0; text-align: center; padding: 8px 20px; background: rgba(255,255,255,0.03); border-bottom: 1px solid rgba(255,255,255,0.06); }\n" +
+"  .close-reminder strong { color: #FFD166; }\n" +
 "  .sel-btns { display: flex; gap: 8px; padding: 8px 16px 4px; }\n" +
 "  .sel-btn { flex: 1; background: rgba(255,255,255,0.07); border: none; border-radius: 8px; color: #8FA3B0; font-size: 0.8rem; font-weight: 600; padding: 7px 4px; }\n" +
 "  .sel-btn:active { background: rgba(255,255,255,0.15); }\n" +
@@ -1493,6 +1889,7 @@ function buildBulkHTML(entries) {
 "  <div class=\"top-title\">✏️ Bulk Edit</div>\n" +
 "  <div class=\"top-count\" id=\"countBadge\">0 selected</div>\n" +
 "</div>\n" +
+"<div class=\"close-reminder\">Tap <strong>Close</strong> (top of screen) when you're done \u2014 changes apply instantly, this list refreshes automatically</div>\n" +
 "<div class=\"sel-btns\">\n" +
 "  <button class=\"sel-btn\" onclick=\"selectAll()\">Select all</button>\n" +
 "  <button class=\"sel-btn\" onclick=\"selectNone()\">Select none</button>\n" +
@@ -1545,6 +1942,36 @@ function buildBulkHTML(entries) {
 "}\n" +
 "function closePanel() { _action = 'bulkClose'; }\n" +
 "</script>\n</body>\n</html>";
+}
+
+// ==================================================================
+//  BUILD BULK CLOSE SCREEN
+//
+//  Shown once there's nothing left to act on (user tapped Cancel, or
+//  every entry has been deleted). Replaces the checklist so nothing
+//  stale lingers on screen, and repeats the native-Close instruction
+//  since Scriptable cannot dismiss the WebView programmatically.
+// ==================================================================
+function buildBulkCloseHTML(message) {
+  const msg = message || "No changes pending.";
+  return "<!DOCTYPE html>\n<html>\n<head>\n" +
+"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\">\n" +
+"<style>\n" +
+"  * { box-sizing: border-box; margin: 0; padding: 0; }\n" +
+"  html { font-size: clamp(1rem, 2.2vw, 1.4rem); }\n" +
+"  body { font-family: -apple-system, sans-serif; background: #0F1923; color: #fff; height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }\n" +
+"  .wrap { text-align: center; max-width: 22rem; }\n" +
+"  .icon { font-size: 2.4rem; margin-bottom: 14px; }\n" +
+"  .msg { font-size: 1rem; font-weight: 700; color: #C8D8E4; margin-bottom: 10px; }\n" +
+"  .hint { font-size: 0.867rem; color: #8FA3B0; line-height: 1.5; }\n" +
+"  .hint strong { color: #FFD166; }\n" +
+"</style>\n</head>\n<body>\n" +
+"<div class=\"wrap\">\n" +
+"  <div class=\"icon\">\u2705</div>\n" +
+"  <div class=\"msg\">" + msg + "</div>\n" +
+"  <div class=\"hint\">Tap <strong>Close</strong> at the top of the screen to return to the dashboard.</div>\n" +
+"</div>\n" +
+"<script>\nvar _action = null;\n</script>\n</body>\n</html>";
 }
 
 // ==================================================================
@@ -1633,14 +2060,18 @@ async function exportJSON() {
 
   const exportObj = {
     meta: {
-      exportDate:  now.toISOString().slice(0, 10),
-      appVersion:  "5.6",
-      cur3Code:    settings.cur3Code,
-      cur3Symbol:  settings.cur3Symbol,
-      cur3Flag:    settings.cur3Flag,
-      cur3Name:    settings.cur3Name,
-      chfToCur3:   settings.chfToCur3,
-      chfToEur:    settings.chfToEur,
+      exportDate:      now.toISOString().slice(0, 10),
+      appVersion:      "5.10",
+      cur3Code:        settings.cur3Code,
+      cur3Symbol:      settings.cur3Symbol,
+      cur3Flag:        settings.cur3Flag,
+      cur3Name:        settings.cur3Name,
+      chfToCur3:       settings.chfToCur3,
+      chfToEur:        settings.chfToEur,
+      tripStart:       settings.tripStart || "",
+      tripEnd:         settings.tripEnd   || "",
+      tripName:        settings.tripName        || "",
+      tripDescription: settings.tripDescription || "",
     },
     entries,
   };
@@ -1652,11 +2083,15 @@ async function exportJSON() {
   const activeCount = entries.filter(e => !e.ghost).length;
   const ghostCount  = entries.length - activeCount;
   const ghostNote   = ghostCount > 0 ? "\n(" + ghostCount + " ghost " + (ghostCount === 1 ? "entry" : "entries") + " included)" : "";
+  const tripNote    = hasValidTripRange(settings)
+    ? "\nTrip dates: " + fmtDate(settings.tripStart) + " \u2013 " + fmtDate(settings.tripEnd) + " stored in file."
+    : "";
+  const nameNote    = settings.tripName ? "\nTrip name: " + settings.tripName + " stored in file." : "";
 
   const confirm = new Alert();
   confirm.title   = "📦 JSON Export ready!";
   confirm.message = entries.length + " entries saved to:\niCloud Drive / Scriptable /\n" + fileName + ghostNote +
-    "\n\nThird currency: " + settings.cur3Flag + " " + settings.cur3Code + " stored in file.";
+    "\n\nThird currency: " + settings.cur3Flag + " " + settings.cur3Code + " stored in file." + tripNote + nameNote;
   confirm.addAction("Done");
   await confirm.presentAlert();
 }
@@ -1761,6 +2196,75 @@ async function importJSON() {
         currentSettings2.chfToCur3 = importedMeta.chfToCur3;
         if (importedMeta.chfToEur) currentSettings2.chfToEur = importedMeta.chfToEur;
         saveSettings(currentSettings2);
+      }
+    }
+  }
+
+  // Trip dates mismatch check — only when meta block carries a valid range
+  if (importedMeta && importedMeta.tripStart && importedMeta.tripEnd &&
+      /^\d{4}-\d{2}-\d{2}$/.test(importedMeta.tripStart) &&
+      /^\d{4}-\d{2}-\d{2}$/.test(importedMeta.tripEnd) &&
+      importedMeta.tripStart <= importedMeta.tripEnd) {
+    const tripSettings = loadSettings();
+    const sameRange = tripSettings.tripStart === importedMeta.tripStart &&
+                       tripSettings.tripEnd   === importedMeta.tripEnd;
+
+    if (!sameRange) {
+      if (!hasValidTripRange(tripSettings)) {
+        // Nothing set yet — adopt the imported range silently, no data to overwrite
+        tripSettings.tripStart = importedMeta.tripStart;
+        tripSettings.tripEnd   = importedMeta.tripEnd;
+        saveSettings(tripSettings);
+      } else {
+        // A different range is already set — confirm before overwriting
+        const tripWarn = new Alert();
+        tripWarn.title   = "⚠️ Trip dates mismatch";
+        tripWarn.message =
+          "This export's trip dates are " + fmtDate(importedMeta.tripStart) + " \u2013 " + fmtDate(importedMeta.tripEnd) + ".\n" +
+          "Your current setting is " + fmtDate(tripSettings.tripStart) + " \u2013 " + fmtDate(tripSettings.tripEnd) + ".\n\n" +
+          "Importing will overwrite your Trip Dates setting to match the export.";
+        tripWarn.addAction("Proceed");
+        tripWarn.addCancelAction("Cancel");
+        const tripWarnRes = await tripWarn.presentAlert();
+        if (tripWarnRes === -1) return; // Cancel — abort entirely
+        tripSettings.tripStart = importedMeta.tripStart;
+        tripSettings.tripEnd   = importedMeta.tripEnd;
+        saveSettings(tripSettings);
+      }
+    }
+  }
+
+  // Trip name/description mismatch check — only when meta block carries
+  // a non-empty name or description.
+  if (importedMeta && (importedMeta.tripName || importedMeta.tripDescription)) {
+    const nameSettings = loadSettings();
+    const importedName = (importedMeta.tripName || "").trim();
+    const importedDesc = (importedMeta.tripDescription || "").trim();
+    const sameTrip = (nameSettings.tripName || "") === importedName &&
+                      (nameSettings.tripDescription || "") === importedDesc;
+
+    if (!sameTrip) {
+      const hasCurrent = !!(nameSettings.tripName || nameSettings.tripDescription);
+      if (!hasCurrent) {
+        // Nothing set yet — adopt the imported name/description silently
+        nameSettings.tripName        = importedName;
+        nameSettings.tripDescription = importedDesc;
+        saveSettings(nameSettings);
+      } else {
+        // A different name/description is already set — confirm before overwriting
+        const nameWarn = new Alert();
+        nameWarn.title   = "⚠️ Trip name mismatch";
+        nameWarn.message =
+          "This export's trip name is \"" + (importedName || "(none)") + "\".\n" +
+          "Your current trip name is \"" + (nameSettings.tripName || "(none)") + "\".\n\n" +
+          "Importing will overwrite your trip name and description to match the export.";
+        nameWarn.addAction("Proceed");
+        nameWarn.addCancelAction("Cancel");
+        const nameWarnRes = await nameWarn.presentAlert();
+        if (nameWarnRes === -1) return; // Cancel — abort entirely
+        nameSettings.tripName        = importedName;
+        nameSettings.tripDescription = importedDesc;
+        saveSettings(nameSettings);
       }
     }
   }
